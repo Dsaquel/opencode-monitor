@@ -1,175 +1,100 @@
-import type { Session } from "@opencode/schema/session"
-import type { MonitorID, MonitorState, SyntheticSender } from "./types.js"
+import { appendBounded, fitBatch, formatNotification, type Batch, type BoundedLines } from "./batch.js"
+import type { MonitorID, MonitorState, SessionID, SyntheticSender } from "./types.js"
 
-const MAX_LINES_PER_BATCH = 200
-const MAX_BYTES_PER_BATCH = 32_000
-
-interface NotifierConfig {
+export interface NotifierConfig {
   readonly monitorID: MonitorID
-  readonly sessionID: Session.ID
+  readonly sessionID: SessionID
   readonly description: string
   readonly interval: number
   readonly send: SyntheticSender
 }
 
 interface NotifierState {
-  readonly pendingLines: ReadonlyArray<string>
+  readonly pending: BoundedLines
   readonly totalLines: number
-  readonly timer: ReturnType<typeof setInterval> | null
   readonly disposed: boolean
-  readonly inflight: Promise<unknown> | null
-}
-
-function formatNotification(
-  monitorID: MonitorID,
-  description: string,
-  state: MonitorState,
-  lines: ReadonlyArray<string>,
-  totalLines: number,
-  omitted: number,
-): string {
-  const header = `<monitor id="${monitorID}" description="${description}" state="${state}" totalLines="${totalLines}">`
-  const footer = "</monitor>"
-  const body = lines.join("\n")
-  const omittedNote = omitted > 0 ? `\n[${omitted} lines omitted — too many for one batch]` : ""
-  return `${header}\n${body}${omittedNote}\n${footer}`
-}
-
-function truncateLines(
-  lines: ReadonlyArray<string>,
-): { kept: ReadonlyArray<string>; omitted: number } {
-  if (lines.length <= MAX_LINES_PER_BATCH) {
-    let bytes = 0
-    for (let i = 0; i < lines.length; i++) {
-      bytes += lines[i].length + 1
-      if (bytes > MAX_BYTES_PER_BATCH) {
-        return { kept: lines.slice(0, i), omitted: lines.length - i }
-      }
-    }
-    return { kept: lines, omitted: 0 }
-  }
-  const kept = lines.slice(lines.length - MAX_LINES_PER_BATCH)
-  return { kept, omitted: lines.length - MAX_LINES_PER_BATCH }
-}
-
-function sendBatch(
-  config: NotifierConfig,
-  lines: ReadonlyArray<string>,
-  totalLines: number,
-  omitted: number,
-  state: MonitorState,
-  resume: boolean,
-): Promise<unknown> {
-  const text = formatNotification(
-    config.monitorID,
-    config.description,
-    state,
-    lines,
-    totalLines,
-    omitted,
-  )
-  return config.send({
-    sessionID: config.sessionID,
-    text,
-    description: `[monitor:${config.monitorID}] ${config.description}`,
-    metadata: {
-      source: "monitor",
-      monitorID: config.monitorID,
-      state,
-      totalLines,
-    },
-    delivery: "steer",
-    resume,
-  })
+  readonly inflight: Promise<void> | null
 }
 
 export interface BatchedNotifier {
   readonly push: (line: string) => void
-  readonly flush: (state: MonitorState, extra?: string) => Promise<void>
+  readonly flush: (state: MonitorState, extra: string) => Promise<void>
   readonly dispose: () => void
   readonly lineCount: () => number
 }
 
-export function createNotifier(input: {
-  readonly monitorID: MonitorID
-  readonly sessionID: Session.ID
-  readonly description: string
-  readonly interval?: number
-  readonly send: SyntheticSender
-}): BatchedNotifier {
-  const config: NotifierConfig = {
-    monitorID: input.monitorID,
-    sessionID: input.sessionID,
-    description: input.description,
-    interval: input.interval ?? 3000,
-    send: input.send,
-  }
+const EMPTY: BoundedLines = { lines: [], dropped: 0 }
 
-  let state: NotifierState = {
-    pendingLines: [],
-    totalLines: 0,
-    timer: null,
-    disposed: false,
-    inflight: null,
-  }
+function sendBatch(
+  config: NotifierConfig,
+  batch: Batch,
+  totalLines: number,
+  state: MonitorState,
+  resume: boolean,
+): Promise<void> {
+  const text = formatNotification({
+    monitorID: config.monitorID,
+    description: config.description,
+    state,
+    totalLines,
+    batch,
+  })
+  return config
+    .send({
+      sessionID: config.sessionID,
+      text,
+      description: `[monitor:${config.monitorID}] ${config.description}`,
+      metadata: { source: "monitor", monitorID: config.monitorID, state, totalLines },
+      delivery: "steer",
+      resume,
+    })
+    .then(
+      () => undefined,
+      (error: unknown) => {
+        console.error(`[opencode-monitor] failed to deliver ${state} notification for ${config.monitorID}:`, error)
+      },
+    )
+}
 
-  function drainPending(): { lines: ReadonlyArray<string>; omitted: number } {
-    const { kept, omitted } = truncateLines(state.pendingLines)
-    state = { ...state, pendingLines: [] }
-    return { lines: kept, omitted }
+export function createNotifier(config: NotifierConfig): BatchedNotifier {
+  let state: NotifierState = { pending: EMPTY, totalLines: 0, disposed: false, inflight: null }
+
+  function drain(): Batch {
+    const batch = fitBatch(state.pending)
+    state = { ...state, pending: EMPTY }
+    return batch
   }
 
   async function tick(): Promise<void> {
-    if (state.disposed || state.pendingLines.length === 0) return
-    const { lines, omitted } = drainPending()
-    const promise = sendBatch(config, lines, state.totalLines, omitted, "streaming", false)
-      .catch(() => {})
-    state = { ...state, inflight: promise }
-    await promise
+    if (state.disposed || state.inflight !== null || state.pending.lines.length === 0) return
+    const inflight = sendBatch(config, drain(), state.totalLines, "streaming", false)
+    state = { ...state, inflight }
+    await inflight
     state = { ...state, inflight: null }
   }
 
   const timer = setInterval(() => void tick(), config.interval)
-  state = { ...state, timer }
+
+  function stop(): void {
+    clearInterval(timer)
+    state = { ...state, disposed: true }
+  }
 
   return {
     push(line: string): void {
       if (state.disposed) return
-      state = {
-        ...state,
-        pendingLines: [...state.pendingLines, line],
-        totalLines: state.totalLines + 1,
-      }
+      state = { ...state, pending: appendBounded(state.pending, line), totalLines: state.totalLines + 1 }
     },
 
-    async flush(finalState: MonitorState, extra?: string): Promise<void> {
+    async flush(finalState: MonitorState, extra: string): Promise<void> {
       if (state.disposed) return
-      if (state.timer !== null) {
-        clearInterval(state.timer)
-      }
-      state = { ...state, timer: null, disposed: true }
-
-      if (state.inflight) {
-        await state.inflight.catch(() => {})
-      }
-
-      const { lines, omitted } = drainPending()
-      const finalLines = extra
-        ? [...lines, extra]
-        : lines.length > 0
-          ? lines
-          : [`Process exited (state: ${finalState})`]
-
-      await sendBatch(config, finalLines, state.totalLines, omitted, finalState, true)
-        .catch(() => {})
+      stop()
+      if (state.inflight !== null) await state.inflight
+      const batch = drain()
+      await sendBatch(config, { ...batch, lines: [...batch.lines, extra] }, state.totalLines, finalState, true)
     },
 
-    dispose(): void {
-      if (state.timer !== null) {
-        clearInterval(state.timer)
-      }
-      state = { ...state, timer: null, disposed: true }
-    },
+    dispose: stop,
 
     lineCount(): number {
       return state.totalLines

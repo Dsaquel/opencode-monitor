@@ -1,109 +1,114 @@
-import type { Session } from "@opencode/schema/session"
+import { createNotifier, type BatchedNotifier } from "./notifier.js"
+import { spawnMonitor, type MonitorProcess, type OutputStream } from "./process.js"
 import type {
-  ActiveMonitor,
   MonitorID,
   MonitorOptions,
-  MonitorResult,
   MonitorState,
+  MonitorSummary,
+  SessionID,
   StopReason,
   SyntheticSender,
 } from "./types.js"
-import { createNotifier, type BatchedNotifier } from "./notifier.js"
-import { spawnMonitor, type MonitorProcess } from "./process.js"
+
+interface ManagedMonitor {
+  readonly options: MonitorOptions
+  readonly startedAt: number
+  readonly process: MonitorProcess
+  readonly notifier: BatchedNotifier
+  readonly timeout: ReturnType<typeof setTimeout> | undefined
+  readonly stopReason: StopReason | undefined
+}
+
+export interface MonitorManager {
+  readonly start: (options: MonitorOptions) => MonitorID
+  readonly stop: (id: MonitorID) => Promise<{ readonly lineCount: number } | undefined>
+  readonly list: (sessionID?: SessionID) => ReadonlyArray<MonitorSummary>
+  readonly stopSession: (sessionID: SessionID) => void
+  readonly stopAll: () => Promise<void>
+}
 
 let counter = 0
 
 function generateID(): MonitorID {
   counter += 1
-  const timestamp = Date.now().toString(36)
-  const seq = counter.toString(36)
-  return `mon-${timestamp}-${seq}` as MonitorID
+  return `mon-${Date.now().toString(36)}-${counter.toString(36)}` as MonitorID
 }
 
-interface ManagedMonitor {
-  readonly monitor: ActiveMonitor
-  readonly process: MonitorProcess
-  readonly notifier: BatchedNotifier
-  readonly stopReason: StopReason
+function resolveState(code: number | null, reason: StopReason | undefined): MonitorState {
+  if (reason === "timeout") return "timeout"
+  if (reason === "until") return "completed"
+  if (reason !== undefined) return "cancelled"
+  return code === 0 ? "completed" : "error"
 }
 
-export interface MonitorManager {
-  readonly start: (options: MonitorOptions) => MonitorResult
-  readonly stop: (id: MonitorID) => Promise<MonitorResult | undefined>
-  readonly list: (sessionID?: Session.ID) => ReadonlyArray<ActiveMonitor & { readonly lineCount: number }>
-  readonly stopAll: () => Promise<void>
-  readonly stopSession: (sessionID: Session.ID) => Promise<void>
+function formatExitInfo(code: number | null, signal: NodeJS.Signals | null, reason: StopReason | undefined): string {
+  const parts = [
+    ...(code !== null ? [`exit code: ${code}`] : []),
+    ...(signal !== null ? [`signal: ${signal}`] : []),
+    ...(reason !== undefined ? [`reason: ${reason}`] : []),
+  ]
+  return parts.length > 0 ? `[${parts.join(", ")}]` : "[exited]"
+}
+
+function formatLine(line: string, stream: OutputStream): string {
+  return stream === "stderr" ? `[stderr] ${line}` : line
 }
 
 export function createManager(send: SyntheticSender): MonitorManager {
   let monitors = new Map<MonitorID, ManagedMonitor>()
 
-  function removeMonitor(id: MonitorID): ManagedMonitor | undefined {
+  function take(id: MonitorID): ManagedMonitor | undefined {
     const existing = monitors.get(id)
     if (!existing) return undefined
     const next = new Map(monitors)
     next.delete(id)
     monitors = next
+    clearTimeout(existing.timeout)
     return existing
   }
 
-  function resolveState(code: number | null, signal: NodeJS.Signals | null, reason: StopReason): MonitorState {
-    if (reason === "timeout") return "timeout"
-    if (reason === "manual" || reason === "session-deleted" || reason === "plugin-unload") return "cancelled"
-    if (reason === "until") return "completed"
-    if (code === 0) return "completed"
-    if (signal) return "error"
-    return "error"
+  function takeWhere(predicate: (managed: ManagedMonitor) => boolean): ReadonlyArray<ManagedMonitor> {
+    const ids = Array.from(monitors).filter(([, managed]) => predicate(managed)).map(([id]) => id)
+    return ids.flatMap((id) => take(id) ?? [])
   }
 
-  function formatExitInfo(code: number | null, signal: NodeJS.Signals | null, reason: StopReason): string {
-    const parts: string[] = []
-    if (code !== null) parts.push(`exit code: ${code}`)
-    if (signal) parts.push(`signal: ${signal}`)
-    if (reason !== "natural") parts.push(`reason: ${reason}`)
-    return parts.length > 0 ? parts.join(", ") : "exited"
+  function requestStop(id: MonitorID, reason: StopReason): void {
+    const existing = monitors.get(id)
+    if (!existing || existing.stopReason !== undefined) return
+    clearTimeout(existing.timeout)
+    monitors = new Map(monitors).set(id, { ...existing, stopReason: reason, timeout: undefined })
+    existing.process.kill()
   }
 
-  async function finalize(
-    managed: ManagedMonitor,
-    code: number | null,
-    signal: NodeJS.Signals | null,
-  ): Promise<void> {
-    const state = resolveState(code, signal, managed.stopReason)
-    const extra = formatExitInfo(code, signal, managed.stopReason)
-    try {
-      await managed.notifier.flush(state, extra)
-    } catch {
-      // Notification delivery failure is non-fatal (session may be gone)
+  function handleLine(id: MonitorID, line: string, stream: OutputStream): void {
+    const managed = monitors.get(id)
+    if (!managed || managed.stopReason !== undefined) return
+    const { filter, until } = managed.options
+    if (until?.test(line)) {
+      managed.notifier.push(formatLine(line, stream))
+      requestStop(id, "until")
+      return
     }
+    if (filter === undefined || filter.test(line)) managed.notifier.push(formatLine(line, stream))
   }
 
-  function handleClose(
-    id: MonitorID,
-    code: number | null,
-    signal: NodeJS.Signals | null,
-  ): void {
-    const managed = removeMonitor(id)
+  function handleClose(id: MonitorID, code: number | null, signal: NodeJS.Signals | null): void {
+    const managed = take(id)
     if (!managed) return
-    void finalize(managed, code, signal)
+    const state = resolveState(code, managed.stopReason)
+    void managed.notifier.flush(state, formatExitInfo(code, signal, managed.stopReason))
   }
 
   function handleError(id: MonitorID, error: Error): void {
-    const managed = removeMonitor(id)
+    const managed = take(id)
     if (!managed) return
-    void managed.notifier.flush("error", `spawn error: ${error.message}`).catch(() => {})
-  }
-
-  function setStopReason(id: MonitorID, reason: StopReason): void {
-    const existing = monitors.get(id)
-    if (!existing) return
-    monitors = new Map(monitors).set(id, { ...existing, stopReason: reason })
+    managed.process.kill()
+    void managed.notifier.flush("error", `[spawn error: ${error.message}]`)
   }
 
   return {
-    start(options: MonitorOptions): MonitorResult {
+    start(options: MonitorOptions): MonitorID {
       const id = generateID()
-
       const notifier = createNotifier({
         monitorID: id,
         sessionID: options.sessionID,
@@ -112,18 +117,12 @@ export function createManager(send: SyntheticSender): MonitorManager {
         send,
       })
 
-      let monitorProcess: MonitorProcess
+      let child: MonitorProcess
       try {
-        monitorProcess = spawnMonitor(
+        child = spawnMonitor(
+          { command: options.command, cwd: options.cwd },
           {
-            command: options.command,
-            cwd: options.cwd,
-            timeout: options.timeout,
-            filter: options.filter,
-            until: options.until,
-          },
-          notifier,
-          {
+            onLine: (line, stream) => handleLine(id, line, stream),
             onClose: (code, signal) => handleClose(id, code, signal),
             onError: (error) => handleError(id, error),
           },
@@ -133,89 +132,52 @@ export function createManager(send: SyntheticSender): MonitorManager {
         throw error
       }
 
-      const stopReason: StopReason = options.until ? "until" : options.timeout > 0 ? "timeout" : "natural"
-
-      const activeMonitor: ActiveMonitor = {
-        id,
-        command: options.command,
-        sessionID: options.sessionID,
-        description: options.description,
-        state: "streaming",
-        process: monitorProcess.process,
-        startedAt: Date.now(),
-      }
-
+      const timeout = options.timeout > 0 ? setTimeout(() => requestStop(id, "timeout"), options.timeout) : undefined
       monitors = new Map(monitors).set(id, {
-        monitor: activeMonitor,
-        process: monitorProcess,
+        options,
+        startedAt: Date.now(),
+        process: child,
         notifier,
-        stopReason,
+        timeout,
+        stopReason: undefined,
       })
-
-      return {
-        id,
-        state: "streaming",
-        exitCode: null,
-        signal: null,
-        lineCount: 0,
-        stopReason,
-      }
+      return id
     },
 
-    async stop(id: MonitorID): Promise<MonitorResult | undefined> {
-      setStopReason(id, "manual")
-      const managed = removeMonitor(id)
+    async stop(id: MonitorID): Promise<{ readonly lineCount: number } | undefined> {
+      const managed = take(id)
       if (!managed) return undefined
-
       managed.process.kill()
-      await managed.notifier.flush("cancelled", "stopped by user")
-        .catch(() => {})
-
-      return {
-        id,
-        state: "cancelled",
-        exitCode: null,
-        signal: null,
-        lineCount: managed.notifier.lineCount(),
-        stopReason: "manual",
-      }
+      await managed.notifier.flush("cancelled", formatExitInfo(null, null, "manual"))
+      return { lineCount: managed.notifier.lineCount() }
     },
 
-    list(sessionID?: Session.ID): ReadonlyArray<ActiveMonitor & { readonly lineCount: number }> {
-      const entries = Array.from(monitors.values())
-      const filtered = sessionID === undefined
-        ? entries
-        : entries.filter((m) => m.monitor.sessionID === sessionID)
-      return filtered.map((m) => ({
-        ...m.monitor,
-        lineCount: m.notifier.lineCount(),
-      }))
+    list(sessionID?: SessionID): ReadonlyArray<MonitorSummary> {
+      return Array.from(monitors)
+        .filter(([, managed]) => sessionID === undefined || managed.options.sessionID === sessionID)
+        .map(([id, managed]) => ({
+          id,
+          command: managed.options.command,
+          sessionID: managed.options.sessionID,
+          description: managed.options.description,
+          startedAt: managed.startedAt,
+          lineCount: managed.notifier.lineCount(),
+        }))
+    },
+
+    stopSession(sessionID: SessionID): void {
+      for (const managed of takeWhere((m) => m.options.sessionID === sessionID)) {
+        managed.process.kill()
+        managed.notifier.dispose()
+      }
     },
 
     async stopAll(): Promise<void> {
-      const entries = Array.from(monitors.values())
-      monitors = new Map()
-      for (const m of entries) {
-        m.process.kill()
-        m.notifier.dispose()
-      }
-    },
-
-    async stopSession(sessionID: Session.ID): Promise<void> {
-      const toStop: ManagedMonitor[] = []
-      const remaining = new Map<MonitorID, ManagedMonitor>()
-      for (const [id, managed] of monitors) {
-        if (managed.monitor.sessionID === sessionID) {
-          toStop.push(managed)
-        } else {
-          remaining.set(id, managed)
-        }
-      }
-      monitors = remaining
-      for (const m of toStop) {
-        m.process.kill()
-        m.notifier.dispose()
-      }
+      const stopped = takeWhere(() => true)
+      for (const managed of stopped) managed.process.kill()
+      await Promise.all(
+        stopped.map((managed) => managed.notifier.flush("cancelled", formatExitInfo(null, null, "plugin-unload"))),
+      )
     },
   }
 }
